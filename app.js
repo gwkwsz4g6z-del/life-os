@@ -9,6 +9,12 @@ const supabaseClient = window.supabase.createClient(
   SUPABASE_PUBLISHABLE_KEY
 );
 
+let cloudSyncReady = false;
+let currentCloudUserId = null;
+let cloudSaveTimer = null;
+let cloudInitPromise = null;
+let cloudInitUserId = null;
+
 const defaultTasks = [
   { title: "Complete morning routine", category: "PERSONAL" },
   { title: "Train or work on mobility", category: "FITNESS" },
@@ -110,11 +116,165 @@ function getDayRecord(dateKey = activeDate) {
   return record;
 }
 
+
 function saveState() {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(appState));
   } catch (error) {
     console.error("Could not save Life OS data:", error);
+  }
+
+  // Save changes to the cloud after a short pause.
+  if (!cloudSyncReady || !currentCloudUserId) return;
+
+  clearTimeout(cloudSaveTimer);
+
+  cloudSaveTimer = setTimeout(async () => {
+    if (!cloudSyncReady || !currentCloudUserId) return;
+
+    const userId = currentCloudUserId;
+
+    const { error } = await supabaseClient
+      .from("lifeos_data")
+      .upsert({
+        user_id: userId,
+        data: appState,
+        updated_at: new Date().toISOString()
+      }, {
+        onConflict: "user_id"
+      });
+
+    if (error) {
+      console.error("Life OS cloud save failed:", error);
+    }
+  }, 600);
+}
+
+
+async function initializeCloudSync(session) {
+  if (!session?.user) {
+    cloudSyncReady = false;
+    currentCloudUserId = null;
+    return;
+  }
+
+  const userId = session.user.id;
+
+  if (cloudSyncReady && currentCloudUserId === userId) {
+    return;
+  }
+
+  // Prevent simultaneous login events from running two initial syncs.
+  if (cloudInitPromise && cloudInitUserId === userId) {
+    return cloudInitPromise;
+  }
+
+  cloudInitUserId = userId;
+
+  cloudInitPromise = (async () => {
+    cloudSyncReady = false;
+    currentCloudUserId = userId;
+
+    const previousUserId = localStorage.getItem(
+      "lifeOS_last_user_id"
+    );
+
+    // If another account used this browser, don't transfer
+    // that account's local data to the newly signed-in user.
+    if (previousUserId && previousUserId !== userId) {
+      appState.nextTaskId = 4;
+      appState.days = {};
+      appState.goals = [];
+    }
+
+    const { data, error } = await supabaseClient
+      .from("lifeos_data")
+      .select("data")
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (error) {
+      throw error;
+    }
+
+    if (data?.data && typeof data.data === "object" && !Array.isArray(data.data)) {
+      const cloudState = data.data;
+
+      appState.nextTaskId = Math.max(
+        Number(cloudState.nextTaskId) || 4,
+        4
+      );
+
+      appState.days =
+        cloudState.days &&
+        typeof cloudState.days === "object" &&
+        !Array.isArray(cloudState.days)
+          ? cloudState.days
+          : {};
+
+      appState.goals = Array.isArray(cloudState.goals)
+        ? cloudState.goals
+        : [];
+    }
+    if (data && (
+  !data.data ||
+  typeof data.data !== "object" ||
+  Array.isArray(data.data)
+)) {
+  throw new Error(
+    "The existing cloud record has an unexpected format. No data was overwritten."
+  );
+}
+
+    // Ensure today has a record before the first cloud save.
+    getDayRecord(getDateKey());
+
+    localStorage.setItem(
+      "lifeOS_last_user_id",
+      userId
+    );
+
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(appState)
+    );
+
+    // If this account has no cloud record yet, create one
+    // from its local state. Never overwrite an existing row
+    // during initialisation.
+    if (!data) {
+      const { error: insertError } = await supabaseClient
+        .from("lifeos_data")
+        .insert({
+          user_id: userId,
+          data: appState,
+          updated_at: new Date().toISOString()
+        });
+
+      if (insertError) {
+        throw insertError;
+      }
+    }
+
+    cloudSyncReady = true;
+
+    renderToday();
+    renderProgress();
+
+    // Persist any newly created daily record.
+    saveState();
+  })();
+
+  try {
+    await cloudInitPromise;
+  } catch (error) {
+    cloudSyncReady = false;
+    currentCloudUserId = null;
+    console.error("Life OS cloud initialisation failed:", error);
+    throw error;
+  } finally {
+    cloudInitPromise = null;
+    cloudInitUserId = null;
   }
 }
 
@@ -932,8 +1092,29 @@ async function updateAuthScreen(session) {
 supabaseClient.auth.onAuthStateChange((_event, session) => {
   updateAuthScreen(session);
   authReady = true;
-});
 
+  // Run database requests outside the auth callback.
+  setTimeout(() => {
+    initializeCloudSync(session).catch(() => {
+      authMessage.textContent =
+        "Signed in, but cloud sync could not start. Please check your connection.";
+    });
+  }, 0);
+
+if (
+  data &&
+  (
+    !data.data ||
+    typeof data.data !== "object" ||
+    Array.isArray(data.data)
+  )
+) {
+  throw new Error(
+    "The existing cloud record has an unexpected format. No data was overwritten."
+  );
+}
+
+});
 (async () => {
   const { data, error } = await supabaseClient.auth.getSession();
 
@@ -944,4 +1125,11 @@ supabaseClient.auth.onAuthStateChange((_event, session) => {
 
   await updateAuthScreen(data.session);
   authReady = true;
+
+  try {
+    await initializeCloudSync(data.session);
+  } catch (syncError) {
+    authMessage.textContent =
+      "Cloud sync could not start. Please refresh and try again.";
+  }
 })();
